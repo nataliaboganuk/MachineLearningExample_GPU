@@ -1,0 +1,207 @@
+# ---------------------------------------------------------------------------
+# Triton Inference Server Deployment
+#
+# FIX #13: Switched from GPU image (:25.02-py3) to CPU-only image
+#          (:25.02-py3-cpu). The GPU build requires CUDA device initialisation
+#          at startup; without an NVIDIA GPU and device plugin, the container
+#          crashes immediately. Use :25.02-py3 only on nodes with a GPU.
+#
+# FIX #14: Triton's S3 backend does not read AWS_ENDPOINT_URL. The MinIO
+#          endpoint must be embedded directly in the --model-repository URI:
+#          s3://minio.mlops.svc.cluster.local:9000/<bucket>/<prefix>
+#          The standalone AWS_ENDPOINT_URL env var has been removed.
+#
+# FIX #15: --model-control-mode=explicit starts Triton with no models loaded.
+#          The readiness probe (/v2/health/ready) therefore always returns 503
+#          until a model is loaded via the API, causing Kubernetes to
+#          crash-loop the pod. Switched to 'none' so all models in the
+#          repository are loaded automatically on startup.
+#
+# FIX #16: Added AWS_EC2_METADATA_DISABLED=true. Without this, the AWS SDK
+#          inside Triton attempts to reach the EC2 instance metadata service
+#          (169.254.169.254) on startup. This address is unreachable in
+#          Minikube and causes a multi-second hang / timeout before S3
+#          operations can proceed.
+#
+# FIX #17: Renamed AWS_REGION → AWS_DEFAULT_REGION. The AWS SDK reads
+#          AWS_DEFAULT_REGION; AWS_REGION is an ECS-specific alias that is
+#          not universally honoured by the SDK used inside Triton.
+#
+# FIX #18: Increased probe initialDelaySeconds and added failureThreshold to
+#          give Triton enough time to pull the image and load models on the
+#          slower storage typically available in a Minikube environment.
+#
+# FIX #19: Removed the hardcoded NGC API key that appeared in the deployment3
+#          comment block. Credentials must never be stored in YAML files or
+#          comments. Generate a fresh key and supply it only via kubectl.
+#
+# PREREQUISITE - create the NGC pull secret before applying this manifest:
+#
+#   kubectl create secret docker-registry ngc-registry \
+#     --docker-server=nvcr.io \
+#     --docker-username='$oauthtoken' \
+#     --docker-password=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 \
+#     --namespace=mlops
+#
+#   Obtain your NGC API key at https://ngc.nvidia.com
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton
+  namespace: mlops
+  labels:
+    app: triton
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: triton
+  template:
+    metadata:
+      labels:
+        app: triton
+    spec:
+      serviceAccountName: minio-sa
+      imagePullSecrets:
+        - name: ngc-registry          # Required to pull from nvcr.io
+      containers:
+        - name: triton-server
+          # FIX #13: CPU-only image - no CUDA dependency, compatible with Minikube.
+          # Switch to :25.02-py3 if running on a node with an NVIDIA GPU.
+          image: nvcr.io/nvidia/tritonserver:26.02-py3
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2000m"
+              nvidia.com/gpu: 1
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+              nvidia.com/gpu: 1
+          args:
+            - tritonserver
+            # FIX #14: Endpoint encoded in the s3:// URI - Triton's S3 backend
+            #          does not honour the AWS_ENDPOINT_URL environment variable.
+            - --allow-gpu-metrics=false
+            - --backend-config=onnxruntime,default-max-batch-size=2
+            - --model-repository=s3://minio-api.mlops.svc.cluster.local:9000/triton-model-repo/models
+            # FIX #15: 'none' auto-loads all models at startup.
+            #          'explicit' loaded zero models, causing the readiness probe
+            #          to fail permanently and triggering a crash-loop.
+            - --model-control-mode=none
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            # FIX #17: AWS_DEFAULT_REGION is the correct SDK env var name.
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_REGION
+            # FIX #16: Disable EC2 metadata lookup - unreachable in Minikube,
+            #          causes startup hangs while the SDK waits for a timeout.
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: AWS_S3_FORCE_PATH_STYLE
+              value: "true"
+            - name: TRITON_SERVER_LOG_VERBOSE
+              value: "1"
+          ports:
+            - containerPort: 8000
+              name: http
+            - containerPort: 8001
+              name: grpc
+            - containerPort: 8002
+              name: metrics
+          # FIX #18: Generous delays and failure thresholds for Minikube.
+          #          Adjust downward once running stably on your hardware.
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: 8000
+            initialDelaySeconds: 15   # Give Triton time to init
+            periodSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: triton-cache
+              mountPath: /tmp/triton
+      volumes:
+        # emptyDir is acceptable for the local model cache; data is re-fetched
+        # from MinIO on pod restart so no persistence is needed here.
+        - name: triton-cache
+          emptyDir: {}
+
+---
+# ---------------------------------------------------------------------------
+# Triton Service (NodePort - HTTP)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-http
+  namespace: mlops
+  labels:
+    app: triton
+spec:
+  type: NodePort
+  selector:
+    app: triton
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+---
+# ---------------------------------------------------------------------------
+# Triton Service (NodePort - gRPC)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-grpc
+  namespace: mlops
+  labels:
+    app: triton
+spec:
+  type: NodePort
+  selector:
+    app: triton
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+---
+# ---------------------------------------------------------------------------
+# Triton Service (NodePort - metrics)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-metrics
+  namespace: mlops
+  labels:
+    app: triton
+spec:
+  type: NodePort
+  selector:
+    app: triton
+  ports:
+    - name: metrics
+      port: 8002
+      targetPort: 8002

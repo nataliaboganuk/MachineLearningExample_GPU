@@ -1,0 +1,148 @@
+# ---------------------------------------------------------------------------
+# second_stage_deployment.yaml
+#
+# Apply this manifest AFTER first_deployment2.yaml is fully ready (i.e. the
+# MinIO pod is Running and its readiness probe is passing).
+#
+# What this stage does:
+#   1. Creates the "triton-model-repo" bucket and seeds the Triton model repo
+#      directory structure inside it.
+#   2. Creates the "datasets" bucket for raw / processed dataset storage.
+#
+# Dependencies (must already exist in the cluster):
+#   - Namespace:  mlops
+#   - ConfigMap:  minio-config
+#   - Secret:     minio-credentials
+#   - ServiceAccount: minio-sa
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ConfigMap - additional bucket names for second-stage init
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-init-config
+  namespace: mlops
+data:
+  DATASETS_BUCKET: "datasets"
+
+---
+# ---------------------------------------------------------------------------
+# Init Job - create buckets and seed Triton model repo structure in MinIO
+#
+# Buckets created:
+#   • triton-model-repo  (original bucket, unchanged behaviour)
+#   • datasets           (new bucket for dataset storage)
+#
+# Retry strategy: backoffLimit 5 with OnFailure restartPolicy.
+# The readiness loop uses 'mc alias set' retries (nc is not in the mc image).
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init-bucket
+  namespace: mlops
+spec:
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: minio-sa
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          env:
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_ENDPOINT
+            - name: MINIO_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_BUCKET
+            - name: MINIO_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_REGION
+            - name: DATASETS_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-init-config
+                  key: DATASETS_BUCKET
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              ALIAS="localminio"
+              ENDPOINT="http://${MINIO_ENDPOINT}"
+
+              echo "=== Stage 2: MinIO bucket initialisation ==="
+              echo "Target endpoint: ${ENDPOINT}"
+
+              # ------------------------------------------------------------------
+              # Wait for MinIO to become ready (mc alias set as health probe).
+              # nc is not present in the minio/mc image so we use mc itself.
+              # ------------------------------------------------------------------
+              echo "Waiting for MinIO at ${ENDPOINT} ..."
+              for i in $(seq 1 30); do
+                if mc alias set ${ALIAS} ${ENDPOINT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} --api S3v4 >/dev/null 2>&1; then
+                  echo "MinIO is ready (attempt ${i})."
+                  break
+                fi
+                echo "  attempt ${i}/30 - retrying in 5s..."
+                sleep 5
+              done
+
+              # Final alias set - exits non-zero (triggering Job backoff) if MinIO
+              # is still unreachable after all retries.
+              mc alias set ${ALIAS} ${ENDPOINT} ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} --api S3v4
+
+              # ------------------------------------------------------------------
+              # Bucket: triton-model-repo
+              # ------------------------------------------------------------------
+              echo "--- Bucket: ${MINIO_BUCKET} ---"
+              if mc ls ${ALIAS}/${MINIO_BUCKET} >/dev/null 2>&1; then
+                echo "Bucket '${MINIO_BUCKET}' already exists - skipping creation."
+              else
+                mc mb --region ${MINIO_REGION} ${ALIAS}/${MINIO_BUCKET}
+                echo "Created bucket '${MINIO_BUCKET}'."
+              fi
+
+              # Seed Triton-compatible model repository structure
+              mc cp /dev/null ${ALIAS}/${MINIO_BUCKET}/models/.placeholder                    || true
+              mc cp /dev/null ${ALIAS}/${MINIO_BUCKET}/models/example_model/1/.placeholder    || true
+              echo "Triton model repo structure initialised under ${MINIO_BUCKET}/models."
+
+              # ------------------------------------------------------------------
+              # Bucket: datasets
+              # ------------------------------------------------------------------
+              echo "--- Bucket: ${DATASETS_BUCKET} ---"
+              if mc ls ${ALIAS}/${DATASETS_BUCKET} >/dev/null 2>&1; then
+                echo "Bucket '${DATASETS_BUCKET}' already exists - skipping creation."
+              else
+                mc mb --region ${MINIO_REGION} ${ALIAS}/${DATASETS_BUCKET}
+                echo "Created bucket '${DATASETS_BUCKET}'."
+              fi
+
+              # Seed a conventional top-level structure for dataset storage
+              mc cp /dev/null ${ALIAS}/${DATASETS_BUCKET}/raw/.placeholder        || true
+              mc cp /dev/null ${ALIAS}/${DATASETS_BUCKET}/processed/.placeholder  || true
+              mc cp /dev/null ${ALIAS}/${DATASETS_BUCKET}/external/.placeholder   || true
+              echo "Dataset directory structure initialised under ${DATASETS_BUCKET}/."
+
+              echo "=== Stage 2 initialisation complete ==="

@@ -1,0 +1,324 @@
+# ---------------------------------------------------------------------------
+# Namespace
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlops
+
+---
+# ---------------------------------------------------------------------------
+# ConfigMap - non-confidential MinIO / S3 connection info
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-config
+  namespace: mlops
+data:
+  MINIO_ENDPOINT: "minio-api.mlops.svc.cluster.local:9000"
+  MINIO_BUCKET: "triton-model-repo"
+  MINIO_REGION: "us-east-1"
+  TRITON_MODEL_PREFIX: "models"
+
+---
+# ---------------------------------------------------------------------------
+# Secret - MinIO credentials
+# WARNING: Replace plaintext values with a secrets manager (e.g. Vault,
+#          Sealed Secrets, AWS Secrets Manager) before production use.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: mlops
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: "minioadmin"
+  MINIO_ROOT_PASSWORD: "minioadminpassword"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadminpassword"
+
+---
+# ---------------------------------------------------------------------------
+# ServiceAccount
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minio-sa
+  namespace: mlops
+
+---
+# ---------------------------------------------------------------------------
+# PersistentVolumeClaim - MinIO data (replaces emptyDir)
+# Adjust storageClassName to match your cluster (e.g. standard, gp2, longhorn).
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data-pvc
+  namespace: mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # storageClassName: standard   # Uncomment and set for your cluster
+
+---
+# ---------------------------------------------------------------------------
+# MinIO Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: mlops
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      serviceAccountName: minio-sa
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "2000m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: MINIO_ROOT_PASSWORD
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data-pvc
+
+---
+# ---------------------------------------------------------------------------
+# MinIO API Service (NodePort)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-api
+  namespace: mlops
+  labels:
+    app: minio
+spec:
+  type: NodePort
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+  selector:
+    app: minio
+
+---
+# ---------------------------------------------------------------------------
+# MinIO Console Service (NodePort)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-webui
+  namespace: mlops
+  labels:
+    app: minio
+spec:
+  type: NodePort
+  ports:
+    - name: console
+      port: 9001
+      targetPort: 9001
+  selector:
+    app: minio
+
+---
+# ---------------------------------------------------------------------------
+# PersistentVolumeClaim - JupyterLab workspace (replaces emptyDir)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyter-workspace-pvc
+  namespace: mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: standard   # Uncomment and set for your cluster
+
+---
+# ---------------------------------------------------------------------------
+# JupyterLab Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyter-lab
+  namespace: mlops
+  labels:
+    app: jupyter-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyter-lab
+  template:
+    metadata:
+      labels:
+        app: jupyter-lab
+    spec:
+      serviceAccountName: minio-sa
+      containers:
+        - name: jupyter
+          image: jupyter/base-notebook:latest
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "2000m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          args:
+            - start-notebook.sh
+            - --NotebookApp.token=''
+            - --NotebookApp.password=''
+          env:
+            # S3 / MinIO connection - explicit, no envFrom to avoid scheme ambiguity
+            - name: AWS_ENDPOINT_URL
+              value: "http://minio.mlops.svc.cluster.local:9000"
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_REGION
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_ENDPOINT
+            - name: MINIO_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: minio-config
+                  key: MINIO_BUCKET
+          ports:
+            - containerPort: 8888
+              name: http
+          volumeMounts:
+            - name: workspace
+              mountPath: /home/jovyan/work
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: jupyter-workspace-pvc
+
+---
+# ---------------------------------------------------------------------------
+# JupyterLab Service (NodePort)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyter-lab
+  namespace: mlops
+  labels:
+    app: jupyter-lab
+spec:
+  type: NodePort
+  selector:
+    app: jupyter-lab
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+      nodePort: 30001
+
+---
+# ---------------------------------------------------------------------------
+# RBAC - Role allowing the ServiceAccount to read secrets and configmaps
+# ---------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: minio-access-role
+  namespace: mlops
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: minio-access-binding
+  namespace: mlops
+subjects:
+  - kind: ServiceAccount
+    name: minio-sa
+    namespace: mlops
+roleRef:
+  kind: Role
+  name: minio-access-role
+  apiGroup: rbac.authorization.k8s.io
