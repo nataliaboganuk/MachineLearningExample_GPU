@@ -1,8 +1,31 @@
-# UK Student Attainment Predictor — GPU MLOps Pipeline
+# UK Student Attainment Predictor — MLOps Pipeline
 
-A full end-to-end machine learning pipeline that trains a Logistic Regression model to predict a student's A-level Maths grade from prior attainment (SATS score, GCSE grade, AS-level grade), then serves live GPU-accelerated predictions via **NVIDIA Triton Inference Server** on a local Kubernetes cluster.
+This project delivers a full end‑to‑end machine‑learning pipeline that trains a Logistic Regression model to predict a 6th‑form student’s A‑Level Maths grade based on their prior attainment, including SATS scores, GCSE grades, and GCE AS‑level results. The trained model is then deployed for live inference using NVIDIA Triton Inference Server running on a local Kubernetes cluster.
 
-> **This is the GPU version.** Compared to the CPU version, it requires a physical NVIDIA GPU in the host machine, NVIDIA drivers, the NVIDIA Container Toolkit, the NVIDIA Device Plugin for Kubernetes, and a different Triton image and `config.pbtxt`. All GPU-specific steps are clearly marked with a **`[GPU]`** tag throughout this document.
+To support the model the dataset of 10,000 rows of purely synthetic student data. (The dataset included in this repo was generated using synthetic_uk_attainment_10000.ipynb. It is pre-built and ready to use — no generation step is required.) The dataset reflects UK national averages for 2024/25, using normally distributed values for SATS (80–120), GCSE grades (1–9), and GCE AS grades (A–U). Each record also includes an A-Level grade that is generated independently during synthetic data creation and then used as the training label. All generated data is saved as a raw CSV file.
+
+System Requirements table — Docker Desktop, Minikube, kubectl, k6, and an NGC account. (Developed and tested on Ubuntu Desktop 24.04 Linux.).
+
+9 numbered steps in strict order:
+
+1 Start Minikube with enough GPU/RAM
+2 Apply **`first_deployment.yaml`** — spins up MinIO + JupyterLab
+3 Apply **`second_deployment.yaml`** — creates the datasets and Triton-model-repo buckets
+— Check for all processes to be running
+4 Upload the CSV File to the MinIO Bucket via the web console (WebUI) (Check if there are in another Bucket files: config.pbtxt and model.onnx- delete them, leftovers from previous CPU run)
+—  Open JupyterLab in a browser
+
+5 Upload and run the notebook (not locally on the device)— with a table explaining what each section does and what a successful upload looks like
+
+6 Open the **`triton_mathmodel_k6_test.js`** in VSCode and align **`TRITON_HOST`** and **`TRITON_PORT`** it must be the same as shows in the terminal.
+
+7 Apply **`third_deployment_gpu.yaml`** — deploys Triton, which auto-loads the model from MinIO
+
+8 Verify Triton health and fire a test inference with curl
+
+9 Run the k6 load test with the correct environment variables
+
+It also includes a grade reference table, expected k6 thresholds, and a Troubleshooting section covering the most common failure points (PVC errors, image pull failures, MinIO path mismatches, and the important note that the notebook must run inside the cluster — not locally).
 
 ---
 
@@ -12,14 +35,13 @@ A full end-to-end machine learning pipeline that trains a Logistic Regression mo
 CSV Dataset (MinIO)
        ↓
 JupyterLab Notebook
-  • EDA & encoding
+  • Exploratory Data Analysis (EDA) & encoding
   • Train Logistic Regression
-  • Export → model.onnx + config.pbtxt  ← KIND_GPU, gpus:[0]
+  • Export → model.onnx + config.pbtxt
   • Upload artefacts back to MinIO
        ↓
-Triton Inference Server (GPU image)
+Triton Inference Server
   • Loads model.onnx from MinIO on startup
-  • Runs ONNX Runtime on GPU 0
   • Serves predictions over HTTP on port 8000
        ↓
 k6 Load Test
@@ -31,31 +53,22 @@ k6 Load Test
 
 ## System Requirements
 
-### Hardware — **[GPU] Required**
-
-| Requirement | Details |
-|-------------|---------|
-| **NVIDIA GPU** | Any CUDA-capable NVIDIA GPU (Maxwell architecture or newer). The Triton image `26.02-py3` requires CUDA 12.x. |
-| RAM | Minimum **12 GB** system RAM (MinIO 2 GB + JupyterLab 2 GB + Triton 4 GB + OS overhead) |
-| Disk | Minimum **40 GB** free (Triton GPU image alone is ~15 GB) |
-
-> If you do not have a physical NVIDIA GPU in the machine, use the **CPU version** of this project instead (`third_deployment.yaml` with `tritonserver:26.02-py3` replaced by `tritonserver:26.02-py3-cpu` and `KIND_CPU` in config.pbtxt).
-
----
-
-### Software to Install
-
-Install all of the following **before** starting the cluster.
-
+Before you start, install all of the following on your machine.
 | Tool | Version | Purpose |
 |------|---------|---------|
-| [NVIDIA GPU Driver](https://www.nvidia.com/drivers) | 535+ (CUDA 12.x compatible) | Host GPU driver — **[GPU] required** |
-| [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) | Latest | Lets Docker/containerd pass the GPU into containers — **[GPU] required** |
-| [Docker Desktop](https://www.docker.com/products/docker-desktop/) / Docker Engine | Latest | Container runtime |
+| [Docker Desktop](https://www.docker.com/products/docker-desktop/) | Latest | Container runtime |
 | [Minikube](https://minikube.sigs.k8s.io/docs/start/) | v1.32+ | Local Kubernetes cluster |
 | [kubectl](https://kubernetes.io/docs/tasks/tools/) | v1.29+ | Kubernetes CLI |
 | [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) | Latest | Load testing tool |
-| [NGC Account](https://ngc.nvidia.com) | — | Required to pull the Triton image from `nvcr.io` |
+| [NVIDIA Driver](https://www.nvidia.com/en-us/drivers/) | ≥ 525 | Required for CUDA 12.x compatibility |
+| [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) | ≥ 12.x | Required by `tritonserver:26.02-py3` |
+| [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) | Latest | Allows Docker to pass the GPU through to containers |
+| [NGC Account](https://ngc.nvidia.com/signin) | — | Required to pull images from `nvcr.io` |
+
+> **Note for Linux users:** This project was developed on Ubuntu 24.04. Use **Docker Engine** installed via `apt`, not Docker Desktop (which is a macOS/Windows product).
+
+> **Hardware:** A CUDA-capable NVIDIA GPU with **≥ 8 GB VRAM** is required. The Triton deployment uses the image (`tritonserver:26.02-py3`).requires CUDA 12.x and NVIDIA driver ≥ 525.
+> **RAM:** Allocate at least **10 GB** to Minikube (MinIO needs 2 GB, JupyterLab 2 GB, Triton 4 GB).
 
 ---
 
@@ -67,166 +80,89 @@ GPU_Project_Repo/
 │   └── synthetic_uk_attainment_10000_clean_1.csv   # 10,000-row synthetic dataset
 ├── Notebooks/
 │   └── FIXED_Completed_Project.ipynb               # Training & export notebook
-├── pbtxt/
-│   └── config.pbtxt                                # [GPU] Pre-written GPU Triton config (reference)
 ├── K8s_Manifests/
-│   ├── first_deployment.yaml        # Stage 1 — Namespace, MinIO, JupyterLab
-│   ├── second_deployment.yaml       # Stage 2 — Bucket init job
-│   ├── third_deployment_gpu.yaml    # [GPU] Stage 3 — Triton with GPU resource requests
-│   └── nvidia-device-plugin.yml     # [GPU] REQUIRED — exposes GPU to Kubernetes pods
+│   ├── first_deployment.yaml    # Stage 1 — Namespace, MinIO, JupyterLab
+│   ├── second_deployment.yaml   # Stage 2 — Bucket init job
+│   ├── upload the dataset to triton    # Stage 2 — Triton Bucket
+│   ├── check if there are files: config.pbtxt and model.onnx- delete them    # Stage 2 — Triton Bucket- lleftovers from previous CPU run
+│   ├── upload and run - notebook to Jupyter lab FIXED_Completed_Project.ipynb    # Stage 2 — load Jupyter lab through the Minio environment
+│   ├── third_deployment_gpu.yaml    # Stage 3 — Triton Inference Server
 └── K6_Test_Scripts/
     └── triton_mathmodel_k6_test.js  # Load test (1,000 inference requests)
 ```
 
 ---
 
-## Key Differences vs the CPU Version
-
-| Area | CPU Version | GPU Version |
-|------|------------|------------|
-| Triton image | `tritonserver:26.02-py3` (cpu variant) | `tritonserver:26.02-py3` (full GPU image) |
-| Kubernetes GPU resource | Not requested | `nvidia.com/gpu: 1` in requests **and** limits |
-| config.pbtxt instance_group | `kind: KIND_CPU` | `kind: KIND_GPU` + `gpus: [ 0 ]` |
-| ONNX batch config | `default-max-batch-size=0` | `default-max-batch-size=8` |
-| GPU metrics flag | Not set | `--allow-gpu-metrics=false` |
-| NVIDIA Device Plugin | Optional | **Mandatory** — must be applied before Triton |
-| Host prerequisites | Docker + Minikube | NVIDIA driver + Container Toolkit + Docker + Minikube |
-| Minikube start flags | `--cpus=4 --memory=10240` | `--gpus=all` added |
-| Disk space needed | ~10 GB | ~40 GB (GPU image is larger) |
-
----
-
 ## Step-by-Step Instructions
 
-### Step 1 — **[GPU]** Verify Your NVIDIA Driver and GPU
+### Step 1 — Start Minikube
 
-On the host machine (not inside any container), confirm NVIDIA drivers are installed and the GPU is visible:
-
-```bash
-nvidia-smi
-```
-
-You should see a table showing your GPU name, driver version (535+), and CUDA version (12.x). If this command is not found, install the NVIDIA driver for your operating system from [https://www.nvidia.com/drivers](https://www.nvidia.com/drivers) before continuing.
-
----
-
-### Step 2 — **[GPU]** Install and Configure the NVIDIA Container Toolkit
-
-The NVIDIA Container Toolkit allows Docker and containerd to pass the GPU through into containers. Without it, Minikube cannot expose the GPU to Kubernetes pods.
-
-**On Ubuntu/Debian:**
-
-```bash
-# Add NVIDIA package repository
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-  sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-
-# Configure the Docker runtime to use NVIDIA
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-**Verify the toolkit is working:**
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.0-base-ubuntu22.04 nvidia-smi
-```
-
-If the GPU table appears inside the container, the toolkit is correctly installed. If you see an error, do not proceed — Minikube will not be able to access the GPU.
-
----
-
-### Step 3 — **[GPU]** Start Minikube with GPU Passthrough
-
-The `--gpus=all` flag is what makes the host GPU available inside the Minikube cluster. It requires the Docker driver.
+Open a terminal and start a local Kubernetes cluster with enough resources. The `--gpus all` flag is required to make the GPU visible inside the cluster:
 
 ```bash
 minikube start \
-  --driver=docker \
-  --gpus=all \
   --cpus=4 \
-  --memory=12288 \
-  --disk-size=50g
+  --memory=10240 \
+  --disk-size=30g \
+  --driver=docker \
+  --container-runtime=docker \
+  --gpus all
 ```
 
 Verify the cluster is running:
 
 ```bash
-kubectl get nodes
+kubectl get pods -A -w
 # Expected: one node with STATUS = Ready
 ```
-
-**[GPU] Confirm the GPU is visible to Kubernetes:**
-
-```bash
-kubectl describe node | grep -A5 "Capacity:"
-# Look for a line containing: nvidia.com/gpu: 1
-```
-
-If `nvidia.com/gpu` does not appear yet, that is expected — it will appear after Step 5 when the NVIDIA Device Plugin is deployed.
-
----
-
-### Step 4 — Create the NGC Image Pull Secret
-
-Triton is pulled from NVIDIA's private registry (`nvcr.io`) and requires an NGC API key.
-
-1. Log in at [https://ngc.nvidia.com](https://ngc.nvidia.com) and generate a Personal API Key.
-2. Run the command below, replacing `YOUR_NGC_API_KEY` with your actual key:
+Verify the GPU is visible to Kubernetes:
 
 ```bash
-kubectl create secret docker-registry ngc-registry \
-  --docker-server=nvcr.io \
-  --docker-username='$oauthtoken' \
-  --docker-password=YOUR_NGC_API_KEY \
-  --namespace=mlops
-```
-
-> **Note:** The `mlops` namespace does not exist yet — it is created in Step 5. If you get a "namespace not found" error, apply `first_deployment.yaml` first (Step 5), then re-run this command.
-
+kubectl get nodes -o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable."nvidia\.com/gpu"
+# Expected: minikube   1
 ---
 
-### Step 5 — Deploy Stage 1: Namespace, MinIO & JupyterLab
+### Step 2 — Deploy Stage 1: Namespace, MinIO & JupyterLab
 
-This manifest creates the `mlops` namespace, MinIO object storage, JupyterLab, PersistentVolumeClaims, ConfigMaps, Secrets, and RBAC roles.
+This manifest creates:
+- The `mlops` namespace
+- MinIO object storage (data + model artefact store)
+- JupyterLab (where the notebook runs)
+- Required ConfigMaps, Secrets, PVCs, and RBAC roles
 
 ```bash
 kubectl apply -f K8s_Manifests/first_deployment.yaml
 ```
 
-Wait for both pods to be running:
+Wait for all pods to be running:
 
 ```bash
-kubectl get pods -n mlops --watch
-# Wait until minio-... and jupyter-lab-... both show STATUS = Running
+kubectl get pods -n mlops -w
+# Wait until both `minio-...` and `jupyter-lab-...` show STATUS = Running 1/1
 ```
+
+This may take a few minutes the first time as Container images are pulled (downloaded).
 
 ---
 
-### Step 6 — Deploy Stage 2: Initialise MinIO Buckets
+### Step 3 — Deploy Stage 2: Initialise MinIO Buckets
 
-This runs a one-off Kubernetes Job that creates two buckets in MinIO:
-- `datasets` — where the CSV dataset will be uploaded
+This runs a one-off Kubernetes Job that connects to MinIO and creates two buckets:
+- `datasets` — where the CSV will be uploaded
 - `triton-model-repo` — where the trained model artefacts will be stored
 
 ```bash
 kubectl apply -f K8s_Manifests/second_deployment.yaml
 ```
 
-Confirm the job completed:
+Confirm the job completed successfully:
 
 ```bash
-kubectl get jobs -n mlops
+kubectl get jobs -n mlops -w
 # Expected: minio-init-bucket   1/1   Completed
 ```
 
-If the job shows `0/1` after a couple of minutes, inspect the logs:
+If it stays in `0/1`, check the logs:
 
 ```bash
 kubectl logs -n mlops job/minio-init-bucket
@@ -234,140 +170,127 @@ kubectl logs -n mlops job/minio-init-bucket
 
 ---
 
-### Step 7 — **[GPU]** Deploy the NVIDIA Device Plugin
+### Step 4 — Upload the Dataset to MinIO
 
-> **This step is mandatory for the GPU version.** It does not exist as a required step in the CPU project. The NVIDIA Device Plugin is a Kubernetes DaemonSet that advertises the GPU as a schedulable resource (`nvidia.com/gpu`). Without it, the Triton pod will stay in `Pending` state because Kubernetes cannot satisfy the GPU resource request.
-
-```bash
-kubectl apply -f K8s_Manifests/nvidia-device-plugin.yml
-```
-
-Wait for the plugin pod to be running:
-
-```bash
-kubectl get pods -n kube-system --watch | grep nvidia
-# Wait for nvidia-device-plugin-daemonset-... STATUS = Running
-```
-
-Now confirm the GPU is registered with Kubernetes:
-
-```bash
-kubectl describe node | grep -A5 "Allocatable:"
-# You must see: nvidia.com/gpu: 1  before proceeding to Step 11
-```
-
-If `nvidia.com/gpu` still does not appear, check the plugin logs:
-
-```bash
-kubectl logs -n kube-system -l name=nvidia-device-plugin-ds
-```
-
----
-
-### Step 8 — Upload the Dataset to MinIO
-
-Get the MinIO Console URL:
+Open the MinIO Console in your browser:
 
 ```bash
 minikube service minio-webui -n mlops --url
 # e.g. http://192.168.49.2:YYYYY
 ```
 
-Open that URL in your browser and log in with:
+Log in with:
 - **Username:** `minioadmin`
 - **Password:** `minioadminpassword`
 
 Then:
 1. Navigate to the **`datasets`** bucket.
-2. Click **Upload** and select `Data/synthetic_uk_attainment_10000_clean_1.csv`.
-3. Confirm the file appears at the root of the bucket — not inside a subfolder — so the notebook can find it at `datasets/synthetic_uk_attainment_10000_clean_1.csv`.
 
+2. Click **Upload** and select `Data/synthetic_uk_attainment_10000_clean_1.csv`.
+
+3. Make sure the file appears at the root of the bucket (not inside a subfolder) so the notebook can find it at `datasets/synthetic_uk_attainment_10000_clean_1.csv`.
+> **If this is not your first run:** navigate to the **`triton-model-repo`** bucket and check for any leftover `config.pbtxt` and `model.onnx` files from a previous CPU run. Delete them before proceeding.
 ---
 
-### Step 9 — Open JupyterLab
+### Step 5 — Open JupyterLab
+
+Get the JupyterLab URL:
 
 ```bash
 minikube service jupyter-lab -n mlops --url
 # e.g. http://192.168.49.2:30001
 ```
-
-Open that URL in a browser. No password is required.
+Open that URL in your browser. No password is required (token authentication is disabled).
 
 ---
 
-### Step 10 — Upload and Run the Notebook
+### Step 6 — Upload and Run the Notebook
 
-1. In JupyterLab, click the **Upload** button and upload `Notebooks/FIXED_Completed_Project.ipynb`.
+1. In JupyterLab, click the **Upload** button (↑ arrow in the file browser) and upload `Notebooks/FIXED_Completed_Project.ipynb`.
+
 2. Open the notebook.
-3. Run all cells **in order** from top to bottom using **Run → Run All Cells**.
+
+3. Run all cells **in order** from top to bottom using **Run → Run All Cells** (or `Shift+Enter` cell by cell).
 
 **What each section of the notebook does:**
 
 | Notebook Section | What It Does |
 |-----------------|-------------|
 | **Install packages** | Installs pandas, scikit-learn, skl2onnx, onnxruntime, s3fs, etc. |
-| **Connect to MinIO** | Connects to `minio-api.mlops.svc.cluster.local:9000` and loads the CSV |
+| **Connect to MinIO** | Connects to MinIO at `minio-api.mlops.svc.cluster.local:9000` and loads the CSV |
 | **Grade mappings** | Defines the 0–6 ordinal scale (U=0, E=1, D=2, C=3, B=4, A=5, A*=6) |
 | **EDA** | Prints distributions and renders a pairplot of all attainment variables |
 | **Encode & split** | Encodes letter grades to numbers, splits 80/20 train/test with stratification |
 | **Train model** | Fits a `StandardScaler → LogisticRegression(lbfgs)` sklearn Pipeline |
 | **Evaluate** | Prints accuracy, classification report, and confusion matrices (7-class + pass/fail) |
 | **Save .pkl** | Saves the sklearn pipeline to `model.pkl` |
-| **Convert to ONNX** | Converts `model.pkl` → `model.onnx`, renames output tensor to `output_label` |
-| **Validate ONNX** | Runs a local test inference with `onnxruntime` |
-| **[GPU] Generate config.pbtxt** | Writes the Triton config with `KIND_GPU` and `gpus: [0]` — different from CPU version |
+| **Convert to ONNX** | Serializes `model.pkl` → `model.onnx`, renames output tensor to `output_label` |
+| **Validate ONNX** | Runs a test inference locally with `onnxruntime` to confirm the model works |
+| **Generate config.pbtxt** | Writes the Triton model configuration file |
 | **Upload to MinIO** | Uploads `config.pbtxt` and `model.onnx` to `triton-model-repo/models/mathmodel/` |
 
-> **[GPU] Important — the config.pbtxt generated by the notebook is the GPU version.** It contains `kind: KIND_GPU` and `gpus: [0]`. A pre-written copy of this same file is also available in `pbtxt/config.pbtxt` for reference. Do not substitute the CPU `KIND_CPU` version here.
-
-After the notebook completes successfully you should see:
+After the notebook completes you should see a confirmation like:
 
 ```
 ✓ All artefacts uploaded to MinIO successfully.
-  triton-model-repo/models/mathmodel/config.pbtxt  (... bytes)
-  triton-model-repo/models/mathmodel/1/model.onnx  (... bytes)
-```
+  triton-model-repo/models/mathmodel/config.pbtxt  (...)
+  triton-model-repo/models/mathmodel/1/model.onnx  (...)
+  
+ Optionally verify the artefacts are present in MinIO:
+
+```bash
+minikube service minio-webui -n mlops --url
+# Log in and navigate to triton-model-repo → models → mathmodel
+# You should see: config.pbtxt and 1/model.onnx
 
 ---
+### Step 7 — Configure the k6 Test Script
 
-### Step 11 — **[GPU]** Deploy Stage 3: Triton Inference Server (GPU)
+Before deploying Triton, note the Minikube IP and the Triton NodePort so you can set them in the load test script.
 
-> **Use `third_deployment_gpu.yaml` — not `third_deployment.yaml`.** The GPU manifest requests `nvidia.com/gpu: 1`, uses the full Triton image (not the `-cpu` variant), and sets `--allow-gpu-metrics=false` and `--backend-config=onnxruntime,default-max-batch-size=8`.
+Get the Minikube IP:
+
+```bash
+minikube ip
+# e.g. 192.168.49.2
+```
+
+The Triton NodePort will be visible after Step 8 (`kubectl get svc -n mlops triton-http`). Open `K6_Test_Scripts/triton_mathmodel_k6_test.js` in your editor and ensure the `TRITON_HOST` and `TRITON_PORT` values will match — or pass them as environment variables at runtime as shown in Step 9.
+
+---
+### Step 8 — Deploy Stage 3: Triton Inference Server 
+
+Now that the model artefacts are in MinIO, deploy Triton:
 
 ```bash
 kubectl apply -f K8s_Manifests/third_deployment_gpu.yaml
 ```
 
 Triton will:
-1. Pull `nvcr.io/nvidia/tritonserver:26.02-py3` — this is a large image (~15 GB) and will take several minutes on the first run.
-2. Initialise the CUDA runtime against GPU 0.
-3. Load `model.onnx` from MinIO and place it on the GPU automatically.
+1. Pull the GPU-only image `nvcr.io/nvidia/tritonserver:26.02-py3` (this is large — ~8 GB — and may take several minutes to pull (download) on first run).
+2. Load `model.onnx` from MinIO automatically on startup.
 
-Monitor the pod:
+Monitor the pod until it is ready:
 
 ```bash
 kubectl get pods -n mlops --watch
 # Wait for triton-... to show STATUS = Running and READY = 1/1
 ```
 
-Watch the startup logs to confirm GPU initialisation and model loading:
+You can watch Triton's startup logs to confirm the model loaded:
 
 ```bash
 kubectl logs -n mlops deploy/triton -f
-# Look for lines similar to:
-#   "Triton server has ... GPU(s)"
-#   "Successfully loaded model 'mathmodel'"
+# Look for: "Successfully loaded model 'mathmodel'"
 ```
 
-> **If the pod stays in `Pending`:** The GPU resource cannot be scheduled. Run `kubectl describe pod -n mlops -l app=triton` and look for `Insufficient nvidia.com/gpu`. This means the NVIDIA Device Plugin from Step 7 has not registered the GPU yet, or the `nvidia-device-plugin.yml` was not applied.
-
-> **If the pod crashes with CUDA errors:** Confirm the host NVIDIA driver is version 535+ and that `nvidia-smi` works correctly on the host. The Triton 26.02 image requires CUDA 12.x.
+> **If the pod crashes:** The most common cause is that the model artefacts were not uploaded correctly in Step 7. Check the logs with `kubectl logs -n mlops deploy/triton`. Also verify the files exist in MinIO at `triton-model-repo/models/mathmodel/config.pbtxt` and `triton-model-repo/models/mathmodel/1/model.onnx`.
 
 ---
 
-### Step 12 — Verify Triton Is Serving GPU Predictions
+### Step 9 — Verify Triton Is Serving Predictions
 
-Find the Triton HTTP NodePort:
+Find the NodePort Triton is listening on:
 
 ```bash
 kubectl get svc -n mlops triton-http
@@ -384,22 +307,15 @@ minikube ip
 Test the health endpoint:
 
 ```bash
-curl http://$(minikube ip):<NODEPORT>/v2/health/ready
-# Expected: HTTP 200 with body {}
+curl http://$(minikube ip):<PORT>/v2/health/ready
+# Expected HTTP 200 with body: {}
 ```
 
-**[GPU] Confirm the model is using the GPU:**
-
-```bash
-curl -s http://$(minikube ip):<NODEPORT>/v2/models/mathmodel/config | python3 -m json.tool | grep -A5 instance_group
-# Look for: "kind": "KIND_GPU"
-```
-
-Test a live inference (SATS=105, GCSE grade=6, AS grade B=4):
+Test a live inference (student with SATS=105, GCSE=6, AS grade B=4):
 
 ```bash
 curl -s -X POST \
-  http://$(minikube ip):<NODEPORT>/v2/models/mathmodel/versions/1/infer \
+  http://$(minikube ip):<PORT>/v2/models/mathmodel/versions/1/infer \
   -H "Content-Type: application/json" \
   -d '{
     "id": "test-1",
@@ -417,12 +333,16 @@ The response will contain `output_label` with an integer 0–6 mapping to grades
 
 ---
 
-### Step 13 — Run the k6 Load Test
+### Step 10 — Run the k6 Load Test
+
+The load test sends all 1,000 pre-encoded test rows to Triton sequentially and reports latency and error statistics.
+
+Pass the Minikube IP and Triton NodePort as environment variables:
 
 ```bash
 k6 run \
   -e TRITON_HOST=$(minikube ip) \
-  -e TRITON_PORT=<NODEPORT> \
+  -e TRITON_PORT=<PORT> \
   K6_Test_Scripts/triton_mathmodel_k6_test.js
 ```
 
@@ -435,29 +355,7 @@ k6 run \
 | Triton inference OK rate | > 99% |
 | 99th-percentile latency | < 1,000 ms |
 
-Because the model runs on the GPU, you should see lower latency figures than the CPU version, particularly under concurrent load.
-
----
-
-## The `pbtxt/config.pbtxt` File Explained
-
-This file is an extra reference included in the GPU project that does not exist in the CPU version. It contains the complete pre-written Triton configuration for GPU deployment:
-
-```protobuf
-name: "mathmodel"
-backend: "onnxruntime"
-max_batch_size: 0
-
-instance_group [
-  {
-    count: 1
-    kind: KIND_GPU      ← runs on the GPU, not CPU
-    gpus: [ 0 ]         ← specifically GPU index 0
-  }
-]
-```
-
-The notebook generates and uploads this same content automatically. You only need to use this file manually if the notebook's config generation cell fails and you want to upload `config.pbtxt` directly via the MinIO web console. In that case, upload it to `triton-model-repo/models/mathmodel/config.pbtxt`.
+A successful run ends with `✓` checks next to all thresholds.
 
 ---
 
@@ -480,33 +378,33 @@ Features fed to the model: `[SATS_score (int), GCSE_grade_num (1–9), GCE_AS_gr
 
 ## Troubleshooting
 
-**`nvidia-smi` not found on the host**
-Install the NVIDIA driver for your OS. On Ubuntu: `sudo apt install nvidia-driver-535`. Reboot after installation.
+**GPU not visible to Kubernetes**
+```bash
+kubectl get nodes -o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable."nvidia\.com/gpu"
+# If GPU column shows <none>, ensure:
+# 1. nvidia-container-toolkit is installed and Docker is configured to use it
+# 2. Minikube was started with --gpus all
+# 3. The NVIDIA device plugin DaemonSet is running:
+kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds
+```
 
-**`docker run --gpus all` fails**
-The NVIDIA Container Toolkit is not installed or `nvidia-ctk runtime configure --runtime=docker` was not run. Repeat Step 2 fully and restart Docker.
+**MinIO pod not starting**
+```bash
+kubectl describe pod -n mlops -l app=minio
+# Check for PVC binding errors — you may need to set storageClassName in first_deployment.yaml
+```
 
-**Minikube fails to start with `--gpus=all`**
-Ensure you are using `--driver=docker`. The virtualbox and hyperkit drivers do not support GPU passthrough.
+**Triton crash-loops with "model not found"**
+- Confirm the model artefacts were uploaded correctly by the notebook in **Step 6**, and verify the files exist in MinIO at the correct paths.
+- Check that `second_deployment.yaml` job completed before running the notebook.
 
-**Triton pod stuck in `Pending` — "Insufficient nvidia.com/gpu"**
-The NVIDIA Device Plugin has not registered the GPU. Confirm Step 7 was completed and the plugin pod is Running. Check plugin logs: `kubectl logs -n kube-system -l name=nvidia-device-plugin-ds`.
-
-**Triton pod crashes — CUDA driver/library mismatch**
-The host driver must be compatible with CUDA 12.x. Run `nvidia-smi` and confirm the CUDA version shown is 12.0 or higher. If not, upgrade the NVIDIA driver.
-
-**Triton pod crashes — "model not found" or "failed to load"**
-Confirm the artefacts were uploaded correctly in Step 10. Verify they exist in MinIO at exactly these paths:
-- `triton-model-repo/models/mathmodel/config.pbtxt`
-- `triton-model-repo/models/mathmodel/1/model.onnx`
-
-Also confirm the `config.pbtxt` contains `KIND_GPU` — if it contains `KIND_CPU`, the notebook used the wrong template.
+**k6 shows high error rate**
+- Confirm Triton is ready (`/v2/health/ready` returns 200) before running the test.
+- Double-check the `TRITON_PORT` value from `kubectl get svc -n mlops triton-http`.
 
 **Notebook cannot connect to MinIO**
-The notebook uses the cluster-internal DNS name `minio-api.mlops.svc.cluster.local:9000`. It must run inside the cluster (in the JupyterLab pod from Step 5). Running the notebook on your local laptop will not work.
+- The notebook uses the cluster-internal DNS name `minio-api.mlops.svc.cluster.local:9000`. This only works when the notebook is running *inside* the cluster (i.e. in JupyterLab deployed in **Step 2**). Do not run the notebook locally on your machine.
 
-**k6 high error rate after deployment**
-Wait a full 2–3 minutes after the Triton pod shows `Running` before starting the test — GPU model loading can take additional time after the pod reports ready.
 
 ---
 
@@ -516,7 +414,6 @@ To stop and remove all resources:
 
 ```bash
 kubectl delete namespace mlops
-kubectl delete -f K8s_Manifests/nvidia-device-plugin.yml
 minikube stop
 ```
 
