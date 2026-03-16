@@ -40,7 +40,7 @@
 #   kubectl create secret docker-registry ngc-registry \
 #     --docker-server=nvcr.io \
 #     --docker-username='$oauthtoken' \
-#     --docker-password=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 \
+#     --docker-password=nvidiakey \
 #     --namespace=mlops
 #
 #   Obtain your NGC API key at https://ngc.nvidia.com
